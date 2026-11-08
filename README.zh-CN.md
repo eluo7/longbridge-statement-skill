@@ -8,6 +8,10 @@
 是 **[futu-statement-skill](https://github.com/BH-M87/futu-statement-skill)** 的姊妹篇（另一家券商）。
 两家券商的已实现盈亏合并后，才是最终的财产转让所得。
 
+> 本仓库 fork 自 [BH-M87/longbridge-statement-skill](https://github.com/BH-M87/longbridge-statement-skill)
+> （MIT），由 [eluo7](https://github.com/eluo7) 维护。新增了分配定性（股息 / 资本利得 / 资本返还）、
+> 手工调整台账与按成交日归属。
+
 ## 为什么需要它
 
 和多数券商一样，长桥结单：

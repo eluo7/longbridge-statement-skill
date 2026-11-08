@@ -10,6 +10,11 @@ reconciliation.
 Companion to **[futu-statement-skill](https://github.com/BH-M87/futu-statement-skill)** (the
 other broker). Combine both brokers' realized P&L for the final capital-gains figure.
 
+> This repository is a fork of [BH-M87/longbridge-statement-skill](https://github.com/BH-M87/longbridge-statement-skill)
+> (MIT), maintained by [eluo7](https://github.com/eluo7). It adds distribution characterisation
+> (dividend / capital gain / return of capital), a manual-adjustment ledger and trade-date
+> attribution.
+
 ## Why
 
 Like most brokers, Longbridge statements have:
