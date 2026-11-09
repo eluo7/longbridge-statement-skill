@@ -14,8 +14,14 @@ costed correctly. Cash dividends live in `corps` (corporate actions); financing 
 in `interests` (it is a cost you paid, not income).
 
 Usage:
-    python3 longbridge_tax.py --year 2025 [-o OUTDIR] [--rate 0.90322] [--fx-rate USD=7.1]
+    python3 longbridge_tax.py --year 2025 [-o OUTDIR]
+        [--fx-basis year-end|prior-month-end] [--filing-date YYYY-MM-DD]
+        [--fx-rate USD=<中间价>] [--fx-rates-file FILE] [--no-fx]
         [--distributions FILE] [--adjustments FILE] [--opening-adjustments FILE]
+
+RMB conversion uses the PBOC/CFETS central parity for the statutory as-of date, fetched
+at run time and cached with provenance. NO rate is hardcoded. See --fx-basis and the
+汇率依据 CSV output. Prerequisite for the automatic path: outbound HTTPS to chinamoney.com.cn.
 
 Prerequisite: the official Longbridge CLI installed and authenticated, so that
 `longbridge statement --type monthly --format json` works in your shell. This script
@@ -28,13 +34,16 @@ Outputs (CSV, utf-8-sig; no personal data is embedded — everything comes from 
     longbridge_<YEAR>_期权结算事件.csv        official OptionExpire/OptionExercise settlement rows
     longbridge_<YEAR>_账户净值.csv           per-month asset total (cross-check)
     longbridge_<YEAR>_税务汇总.csv           tax summary: gains/dividends/withheld-tax/interest + tax due
+    longbridge_<YEAR>_汇率依据.csv           every FX rate used, with as-of date, basis and source
     longbridge_<YEAR>_分配明细.csv           distribution character: dividend / capital gain / ROC
     longbridge_<YEAR>_次年成本加回.csv       next-year basis add-back for capital-gain distributions
     longbridge_<YEAR>_手工调整.csv           manual adjustments (quantity/cost/realized/income)
 """
 from __future__ import annotations
-import argparse, csv, json, os, re, shutil, subprocess, sys, time
+import argparse, calendar, csv, json, os, re, shutil, subprocess, sys, time
+import urllib.parse, urllib.request
 from collections import defaultdict
+from datetime import date, datetime, timedelta
 
 # account_balance_changes biz_codes that are internal/round-trip, excluded from cashflow view.
 # LIPOALDR (IPO allotment debit) is the all-in cost of 打新中签 shares — seeded as cost basis
@@ -78,14 +87,98 @@ def option_expiry(code):
     except ValueError:
         return None
 
-# PBOC/CFETS RMB central parity rates on the tax year's final calendar day.
-# Source for 2025: https://www.pbc.gov.cn/zhengcehuobisi/125207/125217/125925/2025123109021714424/index.html
-DEFAULT_FX_RATES_BY_YEAR = {
-    2025: {
-        "HKD": 0.90322,
-        "USD": 7.0288,
-    },
+# ---- FX: PBOC/CFETS RMB central parity (人民币汇率中间价) ------------------------
+# Legal basis for 境外所得个税:
+#   个人所得税法第十六条 / 实施条例第三十二条 / 财政部 税务总局公告 2020 年第 3 号第十二条.
+#   * 年度汇算清缴应补缴部分 → 上一纳税年度最后一日中间价  (--fx-basis year-end, default)
+#   * 按次 / 按月申报         → 办理申报的上一月最后一日中间价 (--fx-basis prior-month-end)
+# Rates are NEVER hardcoded. They are fetched from CFETS for the exact statutory as-of date,
+# cached on disk with full provenance, and the run fails closed when no authoritative rate
+# exists. A stale or invented rate silently misstates a tax return, which is unacceptable.
+CFETS_PARITY_URL = "https://www.chinamoney.com.cn/ags/ms/cm-u-bk-ccpr/CcprHisNew"
+CFETS_SOURCE = "中国人民银行授权中国外汇交易中心(CFETS)公布的人民币汇率中间价 / www.chinamoney.com.cn"
+FX_BASIS_LABEL = {
+    "year-end": "上一纳税年度最后一日（年度汇算清缴；个税法实施条例第三十二条）",
+    "prior-month-end": "办理申报的上一月最后一日（按次/按月申报；个税法实施条例第三十二条）",
+    "as-of": "用户指定日期（--fx-as-of）",
+    "manual": "用户显式指定（--fx-rate / --rate）；其未覆盖的币种不折算",
+    "file": "用户提供的汇率凭证文件（--fx-rates-file）",
+    "disabled": "已用 --no-fx 关闭折算，仅输出原币",
 }
+_PAIR_RE = re.compile(r"^(\d*)([A-Z]{3})/([A-Z]{3})$")
+
+
+def parity_pairs_to_rates(head, values):
+    """CFETS head/values -> {CCY: CNY per 1 unit}. Handles 100JPY/CNY and CNY/XXX quotes."""
+    out = {}
+    for pair, raw in zip(head, values):
+        m = _PAIR_RE.match(str(pair).strip())
+        if not m:
+            continue
+        mult, base, quote = int(m.group(1) or 1), m.group(2), m.group(3)
+        try:
+            v = float(str(raw).replace(",", ""))
+        except (TypeError, ValueError):
+            continue                       # "---" placeholder before the 09:15 publication
+        if v <= 0:
+            continue
+        if quote == "CNY" and base != "CNY":
+            out[base] = v / mult           # e.g. 100JPY/CNY = 4.4797 -> 1 JPY = 0.044797
+        elif base == "CNY" and quote != "CNY":
+            out[quote] = 1.0 / v           # e.g. CNY/MYR = 0.57739 -> 1 MYR = 1.7320
+    return out
+
+
+def fetch_parity(start_date, end_date, retries=2):
+    """Fetch CFETS central-parity history -> [(date, {CCY: rate})] newest first.
+
+    The endpoint returns `records` at the TOP level of the response, and the currency-pair
+    header at `data.head`; `values` are indexed to that header. A form-encoded POST is
+    required for startDate/endDate to take effect (a JSON body silently falls back to the
+    last 30 days). No credentials are involved — this is a public rate feed.
+    """
+    payload = urllib.parse.urlencode({
+        "pageNum": 1, "pageSize": 100,
+        "startDate": start_date, "endDate": end_date,
+    }).encode()
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Referer": "https://www.chinamoney.com.cn/chinese/bkccpr/",
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "*/*",
+    }
+    last = None
+    for attempt in range(retries + 1):
+        try:
+            req = urllib.request.Request(CFETS_PARITY_URL, data=payload,
+                                         headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                doc = json.loads(resp.read().decode("utf-8"))
+            head = doc.get("data", {}).get("head") or []
+            records = doc.get("records") or []          # TOP LEVEL, not data.records
+            if not head or not records:
+                raise ValueError("CFETS returned no parity records")
+            result = []
+            for rec in records:
+                rates = parity_pairs_to_rates(head, rec.get("values") or [])
+                if rates:
+                    result.append((str(rec.get("date", "")), rates))
+            return sorted(result, key=lambda x: x[0], reverse=True)
+        except Exception as exc:                        # network / parse — retried, then raised
+            last = exc
+            if attempt < retries:
+                time.sleep(1 + attempt)
+    raise RuntimeError(f"无法从中国货币网获取人民币汇率中间价: {last}")
+
+
+def fx_as_of_date(basis, year, filing_date=None, as_of=None):
+    """The statutory as-of date for RMB conversion, YYYY-MM-DD."""
+    if as_of:
+        return as_of
+    if basis == "prior-month-end":
+        filing = date.fromisoformat(filing_date) if filing_date else date.today()
+        return (filing.replace(day=1) - timedelta(days=1)).isoformat()
+    return f"{year}-12-31"      # year-end: last calendar day of the tax year being filed
 
 
 def d(s):                                   # '2025.01.07' -> '2025/01/07'
@@ -337,7 +430,8 @@ def _in_year(value, year):
 
 
 def parse_fx_rates(year, rate, fx_rate_args):
-    rates = dict(DEFAULT_FX_RATES_BY_YEAR.get(year, {})) if rate is None and not fx_rate_args else {}
+    """Parse EXPLICIT --rate / --fx-rate values only. No built-in defaults exist any more."""
+    rates = {}
     if rate is not None:
         rates["HKD"] = rate
     for item in fx_rate_args or []:
@@ -354,6 +448,114 @@ def parse_fx_rates(year, rate, fx_rate_args):
     return rates
 
 
+def load_rates_file(path, as_of):
+    """Offline, auditable rate ledger -> ({CCY: rate}, effective_date, source).
+
+    CSV columns: date,currency,rate[,source,note]  (also accepts a JSON list of objects).
+    For each currency the latest row on or before `as_of` wins.
+    """
+    with open(path, encoding="utf-8-sig") as fp:
+        text = fp.read().strip()
+    if text.startswith("["):
+        rows = json.loads(text)
+    else:
+        rows = list(csv.DictReader(text.splitlines()))
+    best, sources = {}, {}
+    for row in rows:
+        day = str(row.get("date", "")).replace("/", "-").strip()
+        ccy = str(row.get("currency", "")).strip().upper()
+        try:
+            value = float(row.get("rate"))
+        except (TypeError, ValueError):
+            continue
+        if not ccy or value <= 0 or day > as_of:
+            continue
+        if ccy not in best or day >= best[ccy][0]:
+            best[ccy] = (day, value)
+            sources[ccy] = str(row.get("source") or path)
+    if not best:
+        raise ValueError(f"汇率文件中没有 {as_of} 当日或之前的有效记录: {path}")
+    return ({c: v for c, (_, v) in best.items()},
+            max(d for d, _ in best.values()),
+            "; ".join(sorted(set(sources.values()))))
+
+
+def resolve_fx_rates(year, rate=None, fx_rate_args=None, *, basis="year-end",
+                     filing_date=None, as_of=None, rates_file=None,
+                     cache_path=None, refresh=False, no_fx=False):
+    """Return ({CCY: CNY per 1 unit}, provenance dict).
+
+    Priority: --no-fx > explicit --rate/--fx-rate > --fx-rates-file > CFETS (cached/on-line).
+    There is deliberately NO built-in rate table: a rate is always tied to a statutory
+    as-of date and a source, and failure to obtain one fails the run instead of guessing.
+    """
+    if no_fx:
+        return {}, {"basis": "disabled", "basis_label": FX_BASIS_LABEL["disabled"],
+                    "as_of": "", "effective_date": "", "source": "", "url": "",
+                    "fetched_at": "", "rates": {}, "per_ccy": {}}
+
+    target = fx_as_of_date(basis, year, filing_date, as_of)
+    effective_basis = "as-of" if as_of else basis
+    manual = parse_fx_rates(year, rate, fx_rate_args)
+
+    if manual:                              # explicit values win and keep the tool offline-capable
+        rates = dict(manual)
+        rates.setdefault("CNY", 1.0)
+        per_ccy = {c: "manual" for c in manual}
+        per_ccy["CNY"] = "identity"
+        meta = {"basis": "manual", "basis_label": FX_BASIS_LABEL["manual"],
+                "as_of": target, "effective_date": target,
+                "source": "用户命令行显式指定", "url": "", "fetched_at": "",
+                "rates": dict(rates), "per_ccy": per_ccy}
+        return rates, meta
+
+    rates, effective, source, per_ccy = {}, target, "", {}
+    if rates_file:
+        rates, effective, source = load_rates_file(rates_file, target)
+        effective_basis = "file"
+        per_ccy = {c: "file" for c in rates}
+    else:
+        cached = None
+        if cache_path and not refresh and os.path.exists(cache_path):
+            try:
+                with open(cache_path, encoding="utf-8") as fp:
+                    cached = json.load(fp)
+                if cached.get("as_of") != target or cached.get("basis") != effective_basis:
+                    cached = None
+            except (OSError, ValueError):
+                cached = None
+        if cached:
+            rates = {k: float(v) for k, v in cached.get("rates", {}).items()}
+            effective = cached.get("effective_date", target)
+            source = cached.get("source", CFETS_SOURCE)
+        else:
+            start = (date.fromisoformat(target) - timedelta(days=20)).isoformat()
+            history = fetch_parity(start, target)
+            if not history:
+                raise RuntimeError(f"{target} 前后 20 天内没有可用的中间价发布记录")
+            effective, rates = history[0]      # latest published on or before the as-of date
+            source = CFETS_SOURCE
+            if cache_path:
+                os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+                with open(cache_path, "w", encoding="utf-8") as fp:
+                    json.dump({"as_of": target, "basis": effective_basis,
+                               "effective_date": effective, "source": source,
+                               "url": CFETS_PARITY_URL,
+                               "fetched_at": datetime.now().isoformat(timespec="seconds"),
+                               "rates": rates}, fp, ensure_ascii=False, indent=2)
+        per_ccy = {c: "cfets" for c in rates}
+
+    rates.setdefault("CNY", 1.0)              # CNY needs no parity quote
+    per_ccy["CNY"] = "identity"
+
+    meta = {"basis": effective_basis, "basis_label": FX_BASIS_LABEL[effective_basis],
+            "as_of": target, "effective_date": effective, "source": source,
+            "url": CFETS_PARITY_URL if effective_basis != "file" else "",
+            "fetched_at": datetime.now().isoformat(timespec="seconds"),
+            "rates": dict(rates), "per_ccy": per_ccy}
+    return rates, meta
+
+
 def sums_by_currency(rows, amount_index, currency_index):
     totals = defaultdict(float)
     for row in rows:
@@ -362,7 +564,10 @@ def sums_by_currency(rows, amount_index, currency_index):
 
 
 def amount_to_rmb(value, currency, fx_rates):
-    rate = fx_rates.get((currency or "").upper())
+    ccy = (currency or "").upper()
+    if ccy in ("CNY", "RMB"):                 # no conversion needed, even with no rate table
+        return round(value, 2)
+    rate = fx_rates.get(ccy)
     return round(value * rate, 2) if rate is not None else ""
 
 
@@ -749,10 +954,24 @@ def main(argv=None):
                          "do not try to name this after the account. If you juggle multiple accounts, "
                          "pass a distinct -o per account yourself, e.g. -o out_acctA -> out_acctA/<year>/")
     ap.add_argument("--rate", type=float, default=None,
-                    help="HKD->RMB rate shorthand, same as --fx-rate HKD=RATE")
+                    help="HKD->RMB shorthand, same as --fx-rate HKD=RATE; any explicit rate "
+                         "disables the automatic CFETS lookup")
     ap.add_argument("--fx-rate", action="append", default=[], metavar="CCY=RATE",
-                    help="currency-specific RMB FX rate, e.g. HKD=0.90322 or USD=7.10; may repeat; "
-                         "defaults to built-in year-end rates when available")
+                    help="explicit CNY rate for one currency, e.g. USD=7.10; may repeat. "
+                         "Currencies you do not list are left unconverted, with a warning")
+    ap.add_argument("--fx-basis", choices=["year-end", "prior-month-end"], default="year-end",
+                    help="statutory conversion date (个税法实施条例第三十二条 / 财税2020年第3号第十二条): "
+                         "'year-end' (default) = 上一纳税年度最后一日中间价 for 年度汇算清缴; "
+                         "'prior-month-end' = 办理申报的上一月最后一日中间价 for 按次/按月申报")
+    ap.add_argument("--filing-date", metavar="YYYY-MM-DD",
+                    help="actual filing date for --fx-basis prior-month-end (default: today)")
+    ap.add_argument("--fx-as-of", metavar="YYYY-MM-DD",
+                    help="override: use the CFETS central parity of this exact date")
+    ap.add_argument("--fx-rates-file", metavar="FILE",
+                    help="offline CSV/JSON rate ledger (date,currency,rate[,source,note]); "
+                         "use when the CFETS feed is unavailable or an adviser supplied rates")
+    ap.add_argument("--no-fx", action="store_true",
+                    help="skip RMB conversion entirely (original-currency report only)")
     ap.add_argument("--on-negative-position", choices=["netcash", "flag", "exclude", "short"],
                     default="netcash",
                     help="how to treat instruments whose position goes negative: "
@@ -794,10 +1013,6 @@ def main(argv=None):
                     help="continue even if some monthly statements are unavailable; the run will be "
                          "understated and the gap is reported loudly")
     args = ap.parse_args(argv)
-    try:
-        fx_rates = parse_fx_rates(args.year, args.rate, args.fx_rate)
-    except argparse.ArgumentTypeError as exc:
-        ap.error(str(exc))
     year = args.year
     # Nest each year in its own subfolder so different years never overwrite each other:
     # out/<year>/ by default (or <-o>/<year>/). Skip if the path already ends in the year
@@ -806,6 +1021,29 @@ def main(argv=None):
     if os.path.basename(os.path.normpath(outdir)) != str(year):
         outdir = os.path.join(outdir, str(year))
     os.makedirs(outdir, exist_ok=True)
+    # FX must be resolved AFTER outdir exists: the fetched rates are cached there with their
+    # as-of date and source so a tax return can be reproduced exactly later.
+    try:
+        fx_rates, fx_meta = resolve_fx_rates(
+            year, args.rate, args.fx_rate,
+            basis=args.fx_basis, filing_date=args.filing_date, as_of=args.fx_as_of,
+            rates_file=args.fx_rates_file,
+            cache_path=os.path.join(outdir, ".fx_rates.json"),
+            refresh=args.refresh, no_fx=args.no_fx)
+    except argparse.ArgumentTypeError as exc:
+        ap.error(str(exc))
+    except (RuntimeError, ValueError, OSError) as exc:
+        sys.exit(
+            f"汇率解析失败: {exc}\n"
+            "本工具不再内置任何固定汇率——人民币折算必须对应法定时点的官方中间价。\n"
+            "处理方式：① 联网后重跑（自动从中国货币网取该日期的中间价）；\n"
+            "  ② --fx-rates-file rates.csv 提供官方汇率凭证（列 date,currency,rate,source）；\n"
+            "  ③ --fx-rate USD=7.10 --fx-rate HKD=0.90 逐币种显式指定（请填官方中间价）；\n"
+            "  ④ --no-fx 只要原币报表。")
+    if fx_meta.get("basis") not in ("manual", "disabled"):
+        print(f"  汇率口径:        {fx_meta['basis_label']} | 基准日 {fx_meta['as_of']} "
+              f"| 采用发布日 {fx_meta['effective_date']}")
+        print(f"  汇率来源:        {fx_meta['source']}")
     cachedir = os.path.join(outdir, ".statements")   # raw monthly JSON cache (see export())
 
     ensure_cli()                                     # offer to install/login if missing (asks first)
@@ -1218,11 +1456,40 @@ def main(argv=None):
                      + ([interest_rmb, ""] if fx_rates else [])
                      + ["—", "非收入;做财产转让可作合理费用参考"])
     if fx_rates:
+        uncovered = [c for c in currencies if c and c not in fx_rates]
+        if uncovered:
+            print(f"  ⚠ 以下币种没有可用汇率，RMB 与应纳税额列留空: {', '.join(uncovered)}；"
+                  f"请用 --fx-rate 补齐，或去掉显式汇率改用自动取数。", file=sys.stderr)
+        if any(not c for c in currencies):
+            print("  ⚠ 存在无币种标记的现金流（多为融资利息）；请用 --base-currency CCY 归类后重跑。",
+                  file=sys.stderr)
         trows.append(["合计·本账户应纳税额(估)", "", "", "", round(tax_total_rmb, 2), "",
                       "= 分红税 + 财产转让税 - 境外预扣抵免(本账户);财产转让最终税额须合并其他账户后确定"])
+        trows.append(["汇率依据", "", "", "", "", "",
+                      f"{fx_meta['basis_label']}；基准日 {fx_meta['as_of']}；"
+                      f"采用 {fx_meta['effective_date']} 中间价；来源 {fx_meta['source']}"])
     else:
-        trows.append(["提示", "", "传 --rate <HKD年末中间价> 或 --fx-rate <币种=年末中间价> 可计算人民币与应纳税额"])
+        trows.append(["提示", "", "已用 --no-fx 跳过人民币折算；去掉该参数即按法定时点自动取官方中间价"])
     w(f"longbridge_{year}_税务汇总.csv", th, trows)
+
+    # Audit trail: every rate used in this return, with its statutory as-of date and source.
+    fxrows = []
+    for ccy in currencies:
+        if not ccy:
+            fxrows.append(["(未识别币种)", "", "", "", "",
+                           "⚠ 该账户存在无币种标记的现金流；用 --base-currency CCY 归类后重跑"])
+            continue
+        r = fx_rates.get(ccy)
+        origin = fx_meta.get("per_ccy", {}).get(ccy)
+        src = ("无需折算（本币）" if origin == "identity" else
+               "用户显式指定（未标注法定时点，请自行核对）" if origin == "manual" else
+               fx_meta.get("source", ""))
+        fxrows.append([ccy, f"{r:.6f}" if r is not None else "",
+                       "" if origin == "identity" else fx_meta.get("effective_date", ""),
+                       fx_meta.get("basis_label", ""), src,
+                       "" if r is not None else "⚠ 无可用汇率，RMB/税额未计算"])
+    w(f"longbridge_{year}_汇率依据.csv",
+      ["货币", "1单位外币折人民币", "中间价发布日", "折算口径", "数据来源", "备注"], fxrows)
 
     # 6) 分配明细（股息 / 资本利得 / 资本返还）与次年成本加回提示
     if distributions:

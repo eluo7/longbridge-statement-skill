@@ -10,6 +10,25 @@ from unittest.mock import patch
 import longbridge_tax
 
 
+# The FX resolver fetches the official CFETS parity for the statutory as-of date. Unit
+# tests must not depend on outbound network access, so the feed is pinned module-wide;
+# FxRateTest overrides it locally for date / basis / failure scenarios.
+FX_2025 = {"USD": 7.0288, "HKD": 0.90322}
+_FX_PATCHER = None
+
+
+def setUpModule():
+    global _FX_PATCHER
+    _FX_PATCHER = patch.object(longbridge_tax, "fetch_parity",
+                               return_value=[("2025-12-31", dict(FX_2025))])
+    _FX_PATCHER.start()
+
+
+def tearDownModule():
+    if _FX_PATCHER is not None:
+        _FX_PATCHER.stop()
+
+
 def trade_row(date, code, name, currency, qty, net, kind="stock"):
     return [date, "", code, name, "买入" if net < 0 else "卖出", kind, currency, qty, 0.0, abs(net), 0.0, net]
 
@@ -171,7 +190,7 @@ class CurrencyHandlingTest(unittest.TestCase):
                 {("HKD", 8.0, 7.2), ("USD", 2.0, 14.2)},
             )
 
-    def test_uses_2025_year_end_default_fx_rates_when_none_are_passed(self):
+    def test_fetches_year_end_parity_when_no_rate_is_passed(self):
         statement = self.multi_currency_statement()
 
         with tempfile.TemporaryDirectory() as outdir:
@@ -191,6 +210,14 @@ class CurrencyHandlingTest(unittest.TestCase):
                 {(r["货币"], float(r["金额(原币)"]), float(r["金额(RMB)"])) for r in capital_rows},
                 {("HKD", 10.0, 9.03), ("USD", 3.0, 21.09)},
             )
+            # Every rate used must be reproducible from the audit trail.
+            fx_path = Path(outdir) / "2025" / "longbridge_2025_汇率依据.csv"
+            with fx_path.open(encoding="utf-8-sig", newline="") as fp:
+                fx_rows = {r["货币"]: r for r in csv.DictReader(fp)}
+            self.assertEqual(float(fx_rows["USD"]["1单位外币折人民币"]), 7.0288)
+            self.assertEqual(float(fx_rows["HKD"]["1单位外币折人民币"]), 0.90322)
+            self.assertEqual(fx_rows["USD"]["中间价发布日"], "2025-12-31")
+            self.assertIn("上一纳税年度最后一日", fx_rows["USD"]["折算口径"])
 
     def multi_currency_statement(self):
         statement = {
@@ -836,6 +863,116 @@ class ManualAdjustmentTest(unittest.TestCase):
             p.write_text("date,code,type,amount\n2025-01-01,ABC,whatever,1\n", encoding="utf-8")
             with self.assertRaises(ValueError):
                 longbridge_tax.load_manual_adjustments(str(p))
+
+
+class FxRateTest(unittest.TestCase):
+    """No hardcoded rates: every rate is tied to a statutory as-of date and a source."""
+
+    def test_no_builtin_rate_table_exists(self):
+        self.assertFalse(hasattr(longbridge_tax, "DEFAULT_FX_RATES_BY_YEAR"))
+
+    def test_statutory_as_of_dates(self):
+        self.assertEqual(longbridge_tax.fx_as_of_date("year-end", 2025), "2025-12-31")
+        self.assertEqual(longbridge_tax.fx_as_of_date("prior-month-end", 2025, "2026-06-15"),
+                         "2026-05-31")
+        self.assertEqual(longbridge_tax.fx_as_of_date("year-end", 2025, as_of="2025-06-30"),
+                         "2025-06-30")
+
+    def test_parity_units_and_unpublished_placeholders(self):
+        head = ["USD/CNY", "100JPY/CNY", "HKD/CNY", "CNY/MYR"]
+        rates = longbridge_tax.parity_pairs_to_rates(head, ["7.0288", "4.4797", "0.90322", "0.57739"])
+        self.assertAlmostEqual(rates["USD"], 7.0288)
+        self.assertAlmostEqual(rates["HKD"], 0.90322)
+        self.assertAlmostEqual(rates["JPY"], 0.044797)          # per 100 JPY -> per 1 JPY
+        self.assertAlmostEqual(rates["MYR"], 1 / 0.57739)       # inverted quote
+        self.assertEqual(longbridge_tax.parity_pairs_to_rates(head, ["---"] * 4), {})
+
+    def test_year_is_part_of_the_lookup(self):
+        with tempfile.TemporaryDirectory() as td:
+            with patch.object(longbridge_tax, "fetch_parity",
+                              return_value=[("2024-12-31", {"USD": 7.1884})]) as feed:
+                rates, meta = longbridge_tax.resolve_fx_rates(
+                    2024, cache_path=os.path.join(td, ".fx_rates.json"))
+            self.assertEqual(rates["USD"], 7.1884)
+            self.assertEqual(meta["as_of"], "2024-12-31")
+            self.assertEqual(meta["basis"], "year-end")
+            self.assertIn("2024-12-31", str(feed.call_args))
+
+    def test_prior_month_end_basis(self):
+        with tempfile.TemporaryDirectory() as td:
+            with patch.object(longbridge_tax, "fetch_parity",
+                              return_value=[("2026-05-29", {"USD": 6.9})]) as feed:
+                _, meta = longbridge_tax.resolve_fx_rates(
+                    2025, basis="prior-month-end", filing_date="2026-06-15",
+                    cache_path=os.path.join(td, ".fx_rates.json"))
+            self.assertEqual(meta["as_of"], "2026-05-31")
+            self.assertEqual(meta["effective_date"], "2026-05-29")   # last published day
+            self.assertIn("上一月最后一日", meta["basis_label"])
+            self.assertIn("2026-05-31", str(feed.call_args))
+
+    def test_cache_prevents_a_second_fetch(self):
+        with tempfile.TemporaryDirectory() as td:
+            cache = os.path.join(td, ".fx_rates.json")
+            with patch.object(longbridge_tax, "fetch_parity",
+                              return_value=[("2025-12-31", dict(FX_2025))]) as feed:
+                first, _ = longbridge_tax.resolve_fx_rates(2025, cache_path=cache)
+                second, meta = longbridge_tax.resolve_fx_rates(2025, cache_path=cache)
+            self.assertEqual(feed.call_count, 1)
+            self.assertEqual(first, second)
+            self.assertEqual(meta["effective_date"], "2025-12-31")
+
+    def test_explicit_rate_short_circuits_the_network(self):
+        with patch.object(longbridge_tax, "fetch_parity",
+                          side_effect=AssertionError("must not fetch")):
+            rates, meta = longbridge_tax.resolve_fx_rates(2025, fx_rate_args=["USD=7.0"])
+        self.assertEqual(rates["USD"], 7.0)
+        self.assertEqual(rates["CNY"], 1.0)         # CNY identity, no network needed
+        self.assertEqual(meta["basis"], "manual")
+
+    def test_offline_rate_ledger(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "rates.csv"
+            p.write_text("date,currency,rate,source\n"
+                         "2025-06-30,USD,7.16,adviser\n"
+                         "2025-12-31,USD,7.0288,PBOC\n"
+                         "2025-12-31,HKD,0.90322,PBOC\n", encoding="utf-8")
+            rates, meta = longbridge_tax.resolve_fx_rates(2025, rates_file=str(p))
+            self.assertEqual(rates["USD"], 7.0288)             # latest <= as-of wins
+            self.assertEqual(rates["HKD"], 0.90322)
+            self.assertEqual(meta["basis"], "file")
+            self.assertIn("PBOC", meta["source"])             # provenance recorded
+
+    def test_cny_needs_no_parity_rate(self):
+        self.assertEqual(longbridge_tax.amount_to_rmb(100, "CNY", {}), 100.0)
+        with tempfile.TemporaryDirectory() as td:
+            with patch.object(longbridge_tax, "fetch_parity",
+                              return_value=[("2025-12-31", {"USD": 7.0288})]):
+                rates, meta = longbridge_tax.resolve_fx_rates(
+                    2025, cache_path=os.path.join(td, ".fx_rates.json"))
+        self.assertEqual(rates["CNY"], 1.0)
+        self.assertEqual(meta["per_ccy"]["CNY"], "identity")
+
+    def test_no_fx_skips_conversion(self):
+        with patch.object(longbridge_tax, "fetch_parity",
+                          side_effect=AssertionError("must not fetch")):
+            rates, meta = longbridge_tax.resolve_fx_rates(2025, no_fx=True)
+        self.assertEqual(rates, {})
+        self.assertEqual(meta["basis"], "disabled")
+
+    def test_fetch_failure_fails_closed(self):
+        with tempfile.TemporaryDirectory() as td:
+            with patch.object(longbridge_tax, "fetch_parity",
+                              side_effect=RuntimeError("network down")):
+                with self.assertRaises(RuntimeError):
+                    longbridge_tax.resolve_fx_rates(
+                        2025, cache_path=os.path.join(td, ".fx_rates.json"))
+            with patch.object(longbridge_tax, "fetch_parity",
+                              side_effect=RuntimeError("network down")):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaises(SystemExit) as ctx:
+                        longbridge_tax.main(["--year", "2025", "-o", td])
+            self.assertIn("汇率解析失败", str(ctx.exception))
+            self.assertIn("--fx-rate", str(ctx.exception))
 
 
 if __name__ == "__main__":

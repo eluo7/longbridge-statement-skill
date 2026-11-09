@@ -4,6 +4,38 @@ All notable changes to the Longbridge statement tax skill are documented here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/); the project is
 date-versioned (no semver tags).
 
+## 2026-11-09
+
+### Changed
+- **Removed the hardcoded FX table.** `DEFAULT_FX_RATES_BY_YEAR` (2025: HKD 0.90322 /
+  USD 7.0288) is gone. Previously `--year 2024` (or any year without a built-in default)
+  silently left every RMB and tax column blank; now the correct statutory rate is resolved
+  for any year. A rate is always tied to a date and a source, never to a release version.
+
+### Added
+- **Statutory FX resolution**: `--fx-basis {year-end,prior-month-end}`, `--filing-date`,
+  `--fx-as-of`, `--fx-rates-file`, `--no-fx`. Fetches the PBOC/CFETS 人民币汇率中间价 from
+  `www.chinamoney.com.cn` for the as-of date (个人所得税法第十六条 / 实施条例第三十二条 /
+  财税 2020 年第 3 号第十二条): `year-end` = December 31 of the tax year for 汇算清缴;
+  `prior-month-end` = last day of the month before filing for 按次/按月申报. Falls back to
+  the latest published day before a non-publishing as-of date, caches the result with
+  provenance in `.fx_rates.json`, and **fails closed** when no authoritative rate exists.
+- **`longbridge_<YEAR>_汇率依据.csv`** audit trail (rate, as-of date, publication date,
+  statutory basis, source) plus a 汇率依据 row in the tax summary.
+- `--refresh` now also bypasses the FX cache. Explicit `--rate` / `--fx-rate` short-circuit
+  the network (offline-capable) and warn about currencies left unconverted.
+- 11 tests covering as-of dates, `100JPY/CNY` and inverted `CNY/XXX` quotes, unpublished
+  `---` placeholders, holiday fallback, cache, offline ledger, explicit override, `--no-fx`
+  and fail-closed behaviour.
+- **Display metadata** in the SKILL.md frontmatter (`display_name`, `display_name_en`,
+  `description_zh/en`, `examples_zh/en`, `version`, `author`) so a user-imported copy is
+  searchable by its Chinese name in WorkBuddy's slash menu.
+
+### Fixed
+- CFETS feed parsing: `records` sits at the **top level** of the response (not
+  `data.records`), and `startDate` / `endDate` only take effect with a form-encoded POST —
+  a JSON body silently returns the last 30 days instead.
+
 ## 2026-11-08
 
 ### Added

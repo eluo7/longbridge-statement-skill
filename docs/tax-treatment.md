@@ -121,7 +121,27 @@ change. The script writes `次年成本加回.csv` for this purpose.
 | ROC / cost adjustment with no position | diagnostic, skipped |
 | Statement key 404 | retry the alternate CDN prefix (`/statement_data/` ↔ `/lb-statement/`) |
 
-## 7. Out of scope (today)
+## 7. FX conversion (statutory as-of date)
+
+Foreign-currency amounts are converted at the PBOC/CFETS 人民币汇率中间价 for the date the
+tax law prescribes — **not** at a rate baked into the tool and **not** at each trade date.
+There is no built-in rate table; the rate is fetched at run time for the as-of date.
+
+| `--fx-basis` | As-of date | Statutory rule |
+|---|---|---|
+| `year-end` (default) | Dec 31 of `--year` | 年度汇算清缴应补缴税款 → 上一纳税年度最后一日 |
+| `prior-month-end` | last day of the month before `--filing-date` | 按次/按月申报 → 办理申报的上一月最后一日 |
+
+Basis: 个人所得税法第十六条、实施条例第三十二条、财政部 税务总局公告 2020 年第 3 号
+第十二条. When the as-of date has no publication (weekend/holiday), the latest published day
+on or before it is used; both dates are written to `汇率依据.csv`. Rates come from the public
+CFETS feed, are cached in `.fx_rates.json` with provenance, and may be replaced by an
+auditable offline ledger (`--fx-rates-file`) or explicit values (`--fx-rate`). **If no
+authoritative rate can be obtained, the run stops** — a guessed rate silently misstates the
+whole return. The tool supplies the rate; choosing which basis applies to a particular
+filing is a legal determination for the taxpayer and their adviser.
+
+## 8. Out of scope (today)
 
 - Automatic retrieval of fund 19a-1 / tax supplements (the character is user-supplied).
 - Non-cash distributions valued at fair value, mergers with mixed consideration (use `cost`).

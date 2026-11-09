@@ -1,6 +1,21 @@
 ---
 name: longbridge-statement-tax
 description: Use when computing realized P&L, dividends, interest, or tax due from a Longbridge (長橋證券) account — for individual income tax on foreign income (个税 境外所得), CRS reporting, accounting, or broker P&L reconciliation. Pulls the official monthly statements via the Longbridge CLI and reconstructs the figures the statement does not provide. Companion to the Futu statement skill.
+description_zh: "长桥证券结单税务计算：抓取官方月结单，重建已实现盈亏、分红与利息，按法定口径换算人民币并估算个税境外所得应纳税额"
+description_en: "Compute realized P&L, dividends, interest and tax due from Longbridge monthly statements"
+display_name: "长桥结单税务"
+display_name_en: "Longbridge Statement Tax"
+version: "2026-11-09"
+author: "eluo7"
+examples_zh:
+  - "计算 2025 年度长桥盈亏、分红和应纳税额"
+  - "生成长桥年度结单的已实现盈亏与税务汇总 CSV"
+  - "核对某笔长桥分红有没有预扣税、属于股息还是资本返还"
+  - "按申报方式取人民币汇率中间价并换算境外所得"
+examples_en:
+  - "Compute my 2025 Longbridge realized P&L, dividends and tax due"
+  - "Export tax-ready CSVs from Longbridge monthly statements"
+  - "Resolve the statutory CNY central parity rate for a filing basis"
 ---
 
 # Longbridge Statement Tax
@@ -67,21 +82,41 @@ logged into the account you mean. Only if you genuinely run **multiple** account
 to separate them — then pass a distinct `-o` per account yourself (e.g. `-o out_acctA`) and
 switch CLI logins between runs.
 
-`--rate` (optional) is the HKD→RMB year-end 中间价 shorthand. For multi-currency statements,
-pass one `--fx-rate CCY=RATE` per currency, e.g. `--fx-rate HKD=0.90322 --fx-rate USD=7.10`.
-Amounts are grouped by currency first; RMB/tax columns are filled only when that currency
-has a matching rate.
+### FX: rates are resolved by date, never hardcoded
 
-For `--year 2025`, if no rate is passed, the script uses the 2025-12-31 PBOC/CFETS central
-parity defaults: `HKD=0.90322`, `USD=7.0288`. Explicit `--rate` / `--fx-rate` values override
-the built-in defaults.
+There is **no built-in rate table**. With no FX flags the script fetches the official
+PBOC/CFETS 人民币汇率中间价 for the statutory as-of date from `www.chinamoney.com.cn`, caches
+it in `<outdir>/<year>/.fx_rates.json` with its date and source, and writes an audit trail to
+`longbridge_<YEAR>_汇率依据.csv`. If the as-of date has no publication (weekend/holiday), the
+latest published day on or before it is used and both dates are reported.
+
+The as-of date follows 个人所得税法第十六条 / 实施条例第三十二条 / 财政部 税务总局公告
+2020 年第 3 号第十二条:
+
+| `--fx-basis` | Statutory as-of date | Use for |
+|---|---|---|
+| `year-end` (default) | `--year` 的 12-31（上一纳税年度最后一日） | 年度汇算清缴应补缴税款 |
+| `prior-month-end` | 办理申报的上一月最后一日，由 `--filing-date` 推算（默认今天） | 按次 / 按月申报 |
+
+`--fx-as-of YYYY-MM-DD` overrides the date directly. If the CFETS feed is unavailable, supply
+an offline ledger with `--fx-rates-file rates.csv` (columns `date,currency,rate,source,note`),
+or pass `--fx-rate CCY=RATE` per currency (and/or the `--rate` HKD shorthand). **Explicit
+rates short-circuit the network**; currencies you do not list are left unconverted with a
+warning. `--no-fx` produces an original-currency-only report. If no authoritative rate can be
+obtained, the run **stops with an error** rather than inventing one — a wrong FX rate silently
+misstates a tax return.
+
+Amounts are grouped by currency first; RMB/tax columns are filled only for currencies with a
+rate. Confirm the applicable basis and FX 口径 with your tax adviser before filing.
 
 `--on-negative-position {netcash,flag,exclude,short}` controls how negative/short positions are
 handled (default `netcash`) — see **Negative positions** below; a `flag`/`netcash` run that
 still reports **non-option** negative positions needs user confirmation, not a silent pass.
 
-Other flags: `--refresh` re-downloads all monthly statements (bypassing the on-disk cache in
-`<outdir>/<year>/.statements/`); `--base-currency CCY` buckets blank-currency financing-interest
+Other flags: `--fx-basis`, `--filing-date`, `--fx-as-of`, `--fx-rates-file`, `--no-fx` (see
+**FX** above); `--refresh` re-downloads all monthly statements and re-fetches the FX rate
+(bypassing the on-disk caches in `<outdir>/<year>/.statements/` and `.fx_rates.json`);
+`--base-currency CCY` buckets blank-currency financing-interest
 lines (the statement gives no currency hint for them); `--allow-missing-months` lets a run
 continue when a monthly statement is unavailable (it warns loudly — results will be understated);
 `--distributions FILE` supplies the tax character of non-dividend distributions (see below);
@@ -98,6 +133,7 @@ reclassifications) — see **Manual adjustments** below.
 | `longbridge_<YEAR>_期权结算事件.csv` | official OptionExpire/OptionExercise settlement rows |
 | `longbridge_<YEAR>_账户净值.csv` | per-month asset total (cross-check) |
 | `longbridge_<YEAR>_税务汇总.csv` | tax summary by currency: gains / dividends / capital-gain distributions / ROC memo / withholding credit / interest + tax due |
+| `longbridge_<YEAR>_汇率依据.csv` | every FX rate used, with its statutory as-of date, publication date, basis and source |
 | `longbridge_<YEAR>_分配明细.csv` | every detected distribution with its character (dividend / capital gain / ROC), source and how it was applied |
 | `longbridge_<YEAR>_次年成本加回.csv` | only for capital-gain distributions: feed to next year's `--opening-adjustments` if the broker reduced cost |
 | `longbridge_<YEAR>_手工调整.csv` | every `--adjustments` row with its type and how it was applied |
@@ -242,8 +278,11 @@ does not fit, record it in `--adjustments` rather than guessing.
    field**, carrying the market only in the remark/symbol (e.g. `Cash Dividend 700.HK`); the
    script recovers it via `settle_ccy()` (`@CCY` tag or `CODE.MARKET` suffix) so the dividend
    is still taxed under HKD/USD rather than dropping into an unknown-currency bucket.
-8. **Default FX rates are year-scoped.** 2025 has built-in PBOC/CFETS 2025-12-31 defaults
-   for HKD and USD. Other years need explicit rates until their defaults are added.
+8. **Never reuse a rate from a different year or a different filing basis.** The rate is
+   fetched for the statutory as-of date at run time (see **FX** above); there are no built-in
+   defaults. `--year 2024` and `--year 2025` legitimately produce different rates, and
+   `--fx-basis prior-month-end` produces a different date from `year-end`. Always attach
+   `汇率依据.csv` to the filing — it is what makes the numbers reproducible.
 9. **IPO-allotted shares (打新中签) have no buy in `stock_trades`.** Their cost basis is the
    `IPO Allotted Amount(Dr)` line in `account_balance_changes` (`biz_code LIPOALDR`); the script
    seeds it automatically. Without it, selling allotted shares would look like a zero-cost short
@@ -261,8 +300,10 @@ does not fit, record it in `--adjustments` rather than guessing.
 
 ## Tax note (个税 境外所得)
 
-Convert each currency to RMB at the year-end 人民币汇率中间价 (`--rate` for HKD, repeated
-`--fx-rate CCY=RATE` for other currencies). `财产转让所得` (capital gains,
-20%) nets gains/losses within the same market across accounts; `利息股息红利所得`
-(dividends, flat 20%) is taxed standalone with no deductions. Confirm netting scope,
-foreign-tax credit, fund-income classification, and FX 口径 with a tax advisor.
+Convert each currency to RMB at the 人民币汇率中间价 for the statutory as-of date
+(`--fx-basis year-end` for 汇算清缴, `prior-month-end` for 按次/按月申报; see **FX** above).
+`财产转让所得` (capital gains, 20%) nets gains/losses within the same market across accounts;
+`利息股息红利所得` (dividends, flat 20%) is taxed standalone with no deductions. Confirm
+netting scope, foreign-tax credit, fund-income classification, and the applicable FX 口径
+with a tax advisor — the script supplies the rate, not the legal determination of which
+date applies to your filing.

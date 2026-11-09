@@ -68,14 +68,26 @@ is not labelled by account. The CLI uses whichever account its token is bound to
 confirm the CLI is logged into the account you mean. If you run multiple accounts, give each
 its own `-o` (e.g. `-o out_acctA`) and switch CLI logins between runs.
 
-`--rate` is kept as the shorthand for the HKD→RMB year-end mid-rate (中间价). If your
-Longbridge statements include more than one currency, pass one `--fx-rate CCY=RATE` per
-currency, such as `--fx-rate HKD=0.90322 --fx-rate USD=7.10`. Amounts are grouped by
-currency first; RMB/tax columns are filled only when that currency has a matching rate.
+### FX: resolved by date, never hardcoded
 
-For `--year 2025`, if you do not pass any rate, the script uses the 2025-12-31 PBOC/CFETS
-central parity defaults: `HKD=0.90322`, `USD=7.0288`. Passing `--rate` or `--fx-rate`
-overrides the built-in defaults.
+There is **no built-in rate table**. With no FX flags the script fetches the official
+PBOC/CFETS RMB central parity (人民币汇率中间价) for the statutory as-of date from
+`www.chinamoney.com.cn`, caches it in `<outdir>/<year>/.fx_rates.json`, and writes an
+audit trail to `longbridge_<YEAR>_汇率依据.csv`. When the as-of date has no publication
+(weekend/holiday), the latest published day on or before it is used; both dates are reported.
+
+The date follows 个人所得税法第十六条 / 实施条例第三十二条 / 财政部 税务总局公告
+2020 年第 3 号第十二条: `--fx-basis year-end` (default) uses December 31 of `--year`
+for 年度汇算清缴; `--fx-basis prior-month-end` uses the last day of the month before
+`--filing-date` for 按次/按月申报. `--fx-as-of YYYY-MM-DD` overrides the date.
+
+If the feed is unavailable, use `--fx-rates-file rates.csv`
+(columns `date,currency,rate,source,note`) or pass `--fx-rate CCY=RATE` per currency
+(`--rate` remains the HKD shorthand). Explicit rates short-circuit the network; currencies
+you do not list are left unconverted with a warning. `--no-fx` produces an
+original-currency-only report. With no authoritative rate available the run **fails
+closed** instead of guessing. `--refresh` re-fetches both statements and rates. Confirm
+which statutory basis applies to your filing with a tax adviser.
 
 ### Outputs (UTF-8-BOM, Excel-friendly)
 
@@ -86,6 +98,7 @@ overrides the built-in defaults.
 | `longbridge_<YEAR>_已实现盈亏_按标的.csv` | realized P&L per instrument (average-cost) |
 | `longbridge_<YEAR>_账户净值.csv` | per-month asset total (cross-check) |
 | `longbridge_<YEAR>_税务汇总.csv` | tax summary by currency — capital gains / dividends / capital-gain distributions / ROC memo / interest + tax due |
+| `longbridge_<YEAR>_汇率依据.csv` | every FX rate used, with statutory as-of date, publication date, basis and source |
 | `longbridge_<YEAR>_分配明细.csv` | every distribution with its character (dividend / capital gain / ROC) and source |
 | `longbridge_<YEAR>_次年成本加回.csv` | capital-gain distributions only: input for next year's `--opening-adjustments` |
 
